@@ -1,0 +1,19 @@
+# Include the README file
+include README.md
+
+# Include the LICENSE file
+include LICENSE
+
+# Include .gitignore (optional)
+include .gitignore
+
+# Include setup.py (optional)
+include setup.py
+
+# Include all the source code
+recursive-include awsdeleter *
+
+# Include test files (if applicable)
+recursive-include tests *
+
+exclude __pycache__/*
