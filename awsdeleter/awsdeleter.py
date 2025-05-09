@@ -1,5 +1,39 @@
+import functools
+import time
+
 import boto3
+import botocore.exceptions
 import click
+
+
+def retry_on_dependency_violation(timeout_seconds=300, delay_seconds=5, backoff=2, max_delay=30):
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            start_time = time.time()
+            attempt = 1
+            delay = delay_seconds
+
+            while True:
+                try:
+                    return func(*args, **kwargs)
+                except botocore.exceptions.ClientError as e:
+                    if "DependencyViolation" in str(e):
+                        elapsed = time.time() - start_time
+                        if elapsed >= timeout_seconds:
+                            raise TimeoutError(f"Timed out retrying {func.__name__} after {timeout_seconds} seconds.")
+                        print(
+                            f"[Retry {attempt}] {func.__name__} failed due to dependency violation. Retrying in {delay}s..."
+                        )
+                        time.sleep(delay)
+                        delay = min(delay * backoff, max_delay)
+                        attempt += 1
+                    else:
+                        raise
+
+        return wrapper
+
+    return decorator
 
 
 def search_resources_with_prefix(prefix, resource):
@@ -38,17 +72,27 @@ def search_resources_with_prefix(prefix, resource):
     return resources
 
 
+@retry_on_dependency_violation(timeout_seconds=300)
 def delete_vpc(vpc_id):
     """Delete VPC and its dependencies."""
     ec2 = boto3.client("ec2")
 
     click.echo(f"Deleting dependencies of VPC {vpc_id}...")
 
+    # Delete NAT Gateways
+    nat_gateways = ec2.describe_nat_gateways(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])["NatGateways"]
+    for nat in nat_gateways:
+        ec2.delete_nat_gateway(NatGatewayId=nat["NatGatewayId"])
+        click.echo(f"Deleted NAT Gateway {nat['NatGatewayId']}.")
+    # Wait for deletion
+    waiter = ec2.get_waiter("nat_gateway_deleted")
+    for nat in nat_gateways:
+        waiter.wait(NatGatewayIds=[nat["NatGatewayId"]])
+
     # Detach and delete Internet Gateways
     igws = ec2.describe_internet_gateways(Filters=[{"Name": "attachment.vpc-id", "Values": [vpc_id]}])[
         "InternetGateways"
     ]
-
     for igw in igws:
         ec2.detach_internet_gateway(InternetGatewayId=igw["InternetGatewayId"], VpcId=vpc_id)
         ec2.delete_internet_gateway(InternetGatewayId=igw["InternetGatewayId"])
@@ -56,14 +100,12 @@ def delete_vpc(vpc_id):
 
     # Delete Subnets
     subnets = ec2.describe_subnets(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])["Subnets"]
-
     for subnet in subnets:
         ec2.delete_subnet(SubnetId=subnet["SubnetId"])
         click.echo(f"Deleted Subnet {subnet['SubnetId']}.")
 
     # Delete Route Tables (excluding main)
     route_tables = ec2.describe_route_tables(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])["RouteTables"]
-
     for rtb in route_tables:
         if not any(assoc.get("Main", False) for assoc in rtb.get("Associations", [])):
             ec2.delete_route_table(RouteTableId=rtb["RouteTableId"])
@@ -71,7 +113,6 @@ def delete_vpc(vpc_id):
 
     # Delete Security Groups (excluding default)
     security_groups = ec2.describe_security_groups(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])["SecurityGroups"]
-
     for sg in security_groups:
         if sg["GroupName"] != "default":
             ec2.delete_security_group(GroupId=sg["GroupId"])
