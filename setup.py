@@ -2,7 +2,7 @@ from setuptools import find_packages, setup
 
 setup(
     name="awsdeleter",
-    version="0.1.0",
+    version="0.1.1",
     description="A CLI tool to search and delete AWS EC2, S3, and VPC resources by prefix",
     author="Omkar Khatavkar",
     author_email="okhatavkar007@gmail.com",
