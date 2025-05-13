@@ -129,6 +129,21 @@ def delete_resource(resource):
     s3 = boto3.client("s3")
 
     if resource["Type"] == "EC2 Instance":
+        # First, release and delete any associated Elastic IPs
+        addresses = ec2.describe_addresses(Filters=[{"Name": "instance-id", "Values": [resource["ID"]]}])
+        for address in addresses.get("Addresses", []):
+            association_id = address.get("AssociationId")
+            allocation_id = address.get("AllocationId")
+
+            if association_id:
+                ec2.disassociate_address(AssociationId=association_id)
+                click.echo(f"Disassociated Elastic IP {address['PublicIp']}.")
+
+            if allocation_id:
+                ec2.release_address(AllocationId=allocation_id)
+                click.echo(f"Released Elastic IP {address['PublicIp']}.")
+
+        # Then terminate the instance
         ec2.terminate_instances(InstanceIds=[resource["ID"]])
         click.echo(f"EC2 Instance {resource['ID']} has been terminated.")
 
@@ -150,7 +165,11 @@ def delete_resource(resource):
     "--resource", default=None, help="Enter the resoruce type wanted to delete e.g. --resource=vpc or ec2 or s3"
 )
 @click.option("--confirm", default=False, help="Enter boolean to delete without getting the confirm popup")
-def main(prefix, resource, confirm):
+@click.option("--force", is_flag=True, help="Force deletion even if prefix is shorter than 8 characters")
+def main(prefix, resource, confirm, force):
+    if len(prefix) < 8 and not force:
+        click.echo("Error: Prefix must be at least 8 characters long. Use --force to override.")
+        raise click.Abort()
     results = search_resources_with_prefix(prefix, resource)
     delete_confirm = None
     if results:
