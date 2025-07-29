@@ -42,7 +42,7 @@ def search_resources_with_prefix(prefix, resource):
     ec2 = boto3.client("ec2")
     s3 = boto3.client("s3")
     if resource is None or resource == "":
-        resource = ["ec2", "s3", "vpc"]
+        resource = ["ec2", "s3", "vpc", "eip"]
     else:
         resource = [str(resource)]
     # EC2 Instances
@@ -68,6 +68,23 @@ def search_resources_with_prefix(prefix, resource):
             for tag in vpc.get("Tags", []):
                 if tag["Key"] == "Name" and tag["Value"].startswith(prefix):
                     resources.append({"Type": "VPC", "ID": vpc["VpcId"], "Name": tag["Value"]})
+
+    if "eip" in resource:
+        addresses = ec2.describe_addresses()
+        for address in addresses["Addresses"]:
+            for tag in address.get("Tags", []):
+                if tag["Key"] == "Name" and tag["Value"].startswith(prefix):
+                    is_assigned = "InstanceId" in address or "NetworkInterfaceId" in address
+                    resources.append(
+                        {
+                            "Type": "Elastic IP",
+                            "ID": address.get("AllocationId"),
+                            "PublicIp": address.get("PublicIp"),
+                            "Name": tag["Value"],
+                            "Assigned": is_assigned,
+                        }
+                    )
+                    break
 
     return resources
 
@@ -123,6 +140,37 @@ def delete_vpc(vpc_id):
     click.echo(f"Deleted VPC {vpc_id}.")
 
 
+def unassign_eip(resource):
+    ec2 = boto3.client("ec2")
+
+    if resource.get("Type") != "Elastic IP":
+        raise ValueError("Provided resource is not an Elastic IP")
+
+    public_ip = resource.get("PublicIp")
+    allocation_id = resource.get("AllocationId") or resource.get("ID")
+
+    # Mask public IP in GitHub Actions logs (optional)
+    print(f"::add-mask::{public_ip}")
+
+    response = ec2.describe_addresses(PublicIps=[public_ip])
+    addresses = response.get("Addresses", [])
+
+    if not addresses:
+        print(f"No Elastic IP found with AllocationId: {allocation_id}")
+        return
+
+    address = addresses[0]
+    association_id = address.get("AssociationId")
+
+    if association_id:
+        ec2.disassociate_address(AssociationId=association_id)
+        print(f"Elastic IP with AllocationId {allocation_id} disassociated.")
+
+    if allocation_id:
+        ec2.release_address(AllocationId=allocation_id)
+        print(f"Elastic IP with AllocationId {allocation_id} released.")
+
+
 def delete_resource(resource):
     """Delete EC2 instance, S3 bucket, or VPC."""
     ec2 = boto3.client("ec2")
@@ -157,6 +205,8 @@ def delete_resource(resource):
 
     elif resource["Type"] == "VPC":
         delete_vpc(resource["ID"])
+    elif resource["Type"] == "Elastic IP":
+        unassign_eip(resource)
 
 
 @click.command()
