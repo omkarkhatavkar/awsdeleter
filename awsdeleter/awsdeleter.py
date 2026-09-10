@@ -176,25 +176,50 @@ def search_resources_with_prefix(prefix, resource_filter):
 
 @retry_on_dependency_violation(timeout_seconds=300)
 def delete_vpc(vpc_id, verbose=False):
-    """Delete a VPC along with everything inside it (Endpoints, NAT, IGW, ENIs, Subnets, Route Tables, NACLs, SGs)."""
+    """Delete a VPC with everything inside it (Instances, Endpoints, NAT, EIPs, IGW, ENIs, Subnets, Route Tables, NACLs, SGs)."""
     ec2 = boto3.client("ec2")
 
-    # Delete VPC Endpoints (they otherwise block subnet/route table deletion)
+    # 1. Terminate EC2 Instances in the VPC
+    instances = ec2.describe_instances(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])
+    instance_ids = [
+        i["InstanceId"]
+        for r in instances.get("Reservations", [])
+        for i in r.get("Instances", [])
+        if i["State"]["Name"] not in ("terminated", "shutting-down")
+    ]
+    if instance_ids:
+        ec2.terminate_instances(InstanceIds=instance_ids)
+        waiter = ec2.get_waiter("instance_terminated")
+        waiter.wait(InstanceIds=instance_ids)
+
+    # 2. Delete VPC Endpoints
     endpoints = ec2.describe_vpc_endpoints(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])["VpcEndpoints"]
     endpoint_ids = [e["VpcEndpointId"] for e in endpoints if e["State"] != "deleted"]
     if endpoint_ids:
         ec2.delete_vpc_endpoints(VpcEndpointIds=endpoint_ids)
 
-    # Delete NAT Gateways
+    # 3. Delete NAT Gateways
     nats = ec2.describe_nat_gateways(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])["NatGateways"]
-    for nat in nats:
-        if nat["State"] != "deleted":
-            ec2.delete_nat_gateway(NatGatewayId=nat["NatGatewayId"])
-    if nats:
+    nat_ids = [n["NatGatewayId"] for n in nats if n["State"] != "deleted"]
+    for nat_id in nat_ids:
+        ec2.delete_nat_gateway(NatGatewayId=nat_id)
+    if nat_ids:
         waiter = ec2.get_waiter("nat_gateway_deleted")
-        waiter.wait(NatGatewayIds=[n["NatGatewayId"] for n in nats])
+        waiter.wait(NatGatewayIds=nat_ids)
 
-    # Detach & Delete Internet Gateways
+    # 4. Disassociate and Release Elastic IPs attached to VPC ENIs
+    enis = ec2.describe_network_interfaces(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])["NetworkInterfaces"]
+    for eni in enis:
+        assoc = eni.get("Association", {})
+        if assoc:
+            assoc_id = assoc.get("AssociationId")
+            alloc_id = assoc.get("AllocationId")
+            if assoc_id:
+                ec2.disassociate_address(AssociationId=assoc_id)
+            if alloc_id:
+                ec2.release_address(AllocationId=alloc_id)
+
+    # 5. Detach & Delete Internet Gateways
     igws = ec2.describe_internet_gateways(Filters=[{"Name": "attachment.vpc-id", "Values": [vpc_id]}])[
         "InternetGateways"
     ]
@@ -202,35 +227,36 @@ def delete_vpc(vpc_id, verbose=False):
         ec2.detach_internet_gateway(InternetGatewayId=igw["InternetGatewayId"], VpcId=vpc_id)
         ec2.delete_internet_gateway(InternetGatewayId=igw["InternetGatewayId"])
 
-    # Delete any leftover unattached Elastic Network Interfaces
+    # 6. Delete leftover unattached Elastic Network Interfaces
     enis = ec2.describe_network_interfaces(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])["NetworkInterfaces"]
     for eni in enis:
         if eni["Status"] == "available":
             ec2.delete_network_interface(NetworkInterfaceId=eni["NetworkInterfaceId"])
 
-    # Delete Subnets
+    # 7. Delete Subnets
     subnets = ec2.describe_subnets(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])["Subnets"]
     for subnet in subnets:
         ec2.delete_subnet(SubnetId=subnet["SubnetId"])
 
-    # Delete Route Tables (excluding main)
+    # 8. Delete Route Tables (excluding main)
     rtbs = ec2.describe_route_tables(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])["RouteTables"]
     for rtb in rtbs:
         if not any(a.get("Main", False) for a in rtb.get("Associations", [])):
             ec2.delete_route_table(RouteTableId=rtb["RouteTableId"])
 
-    # Delete Network ACLs (excluding default)
+    # 9. Delete Network ACLs (excluding default)
     nacls = ec2.describe_network_acls(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])["NetworkAcls"]
     for nacl in nacls:
         if not nacl.get("IsDefault", False):
             ec2.delete_network_acl(NetworkAclId=nacl["NetworkAclId"])
 
-    # Delete Security Groups (excluding default)
+    # 10. Delete Security Groups (excluding default)
     sgs = ec2.describe_security_groups(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])["SecurityGroups"]
     for sg in sgs:
         if sg["GroupName"] != "default":
             ec2.delete_security_group(GroupId=sg["GroupId"])
 
+    # 11. Delete VPC
     ec2.delete_vpc(VpcId=vpc_id)
     log(f"Deleted VPC {vpc_id}.", verbose)
 
@@ -299,9 +325,9 @@ def delete_resource(resource, verbose=False):
 )
 @click.option(
     "--confirm",
-    is_flag=True,
-    default=False,
-    help="Delete resources without individual prompts",
+    type=str,
+    default=None,
+    help="Delete resources without individual prompts (e.g. '--confirm yes')",
 )
 @click.option(
     "--force",
@@ -346,8 +372,16 @@ def main(prefix, resource, confirm, force, verbose, dry_run):
     for res in results:
         log(f" -> [{res['Type']}] ID/Name: {res.get('ID', res['Name'])}", verbose)
 
+    # Parse confirm parameter (accepts strings like 'yes', 'y', 'true', '1')
+    is_confirmed = False
+    if confirm:
+        if isinstance(confirm, str):
+            is_confirmed = confirm.lower() in ["yes", "y", "true", "1"]
+        else:
+            is_confirmed = bool(confirm)
+
     for res in results:
-        if confirm:
+        if is_confirmed:
             delete_confirm = "yes"
         else:
             delete_confirm = click.prompt(f"Delete {res['Type']} ({res.get('ID', res['Name'])})? (yes/y to confirm)")
