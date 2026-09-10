@@ -351,7 +351,6 @@ def main(prefix, resource, confirm, force, verbose, dry_run):
             delete_confirm = "yes"
         else:
             delete_confirm = click.prompt(f"Delete {res['Type']} ({res.get('ID', res['Name'])})? (yes/y to confirm)")
-
         if delete_confirm.lower() in ["yes", "y"]:
             delete_resource(res, verbose)
         else:
